@@ -20,15 +20,14 @@ import (
 	"github.com/idena-network/idena-go/rlp"
 	"github.com/idena-network/idena-go/secstore"
 	"github.com/ipfs/go-cid"
-	"github.com/patrickmn/go-cache"
 	"github.com/pkg/errors"
 	dbm "github.com/tendermint/tm-db"
 	"sync"
-	"time"
 )
 
 var (
 	DuplicateFlipError = errors.New("duplicate flip")
+	FlipIsMissingError = errors.New("flip is missing")
 )
 
 type Flipper struct {
@@ -38,7 +37,7 @@ type Flipper struct {
 	keyspool         *mempool.KeysPool
 	ipfsProxy        ipfs.Proxy
 	hasFlips         bool
-	mutex            sync.Mutex
+	mutex            sync.RWMutex
 	secStore         *secstore.SecStore
 	flips            map[common.Hash]*IpfsFlip
 	flipReadiness    map[common.Hash]bool
@@ -48,7 +47,6 @@ type Flipper struct {
 	cancelLoadingCtx context.CancelFunc
 	bus              eventbus.Bus
 	flipsQueue       chan *types.Flip
-	flipsCache       *cache.Cache
 	flipPublicKey    *ecies.PrivateKey
 	flipPrivateKey   *ecies.PrivateKey
 }
@@ -79,7 +77,6 @@ func NewFlipper(db dbm.DB, ipfsProxy ipfs.Proxy, keyspool *mempool.KeysPool, txp
 		cancelLoadingCtx: cancel,
 		bus:              bus,
 		flipsQueue:       make(chan *types.Flip, 1000),
-		flipsCache:       cache.New(time.Minute, time.Minute*2),
 	}
 	go fp.writeLoop()
 	return fp
@@ -151,8 +148,6 @@ func (fp *Flipper) addNewFlip(flip *types.Flip, local bool) error {
 		return err
 	}
 
-	fp.flipsCache.Add(string(c.Bytes()), flip, cache.DefaultExpiration)
-
 	fp.bus.Publish(&events.NewFlipEvent{Flip: flip})
 
 	fp.epochDb.WriteFlipCid(c.Bytes())
@@ -212,12 +207,12 @@ func (fp *Flipper) PrepareFlip(flipPublicPart []byte, flipPrivatePart []byte) (c
 
 func (fp *Flipper) GetFlip(key []byte) (publicPart []byte, privatePart []byte, err error) {
 
-	fp.mutex.Lock()
+	fp.mutex.RLock()
 	ipfsFlip := fp.flips[common.Hash(rlp.Hash(key))]
-	fp.mutex.Unlock()
+	fp.mutex.RUnlock()
 
 	if ipfsFlip == nil {
-		return nil, nil, errors.New("flip is missing")
+		return nil, nil, FlipIsMissingError
 	}
 
 	var publicEncryptionKey *ecies.PrivateKey
@@ -255,8 +250,8 @@ func (fp *Flipper) GetFlip(key []byte) (publicPart []byte, privatePart []byte, e
 }
 
 func (fp *Flipper) GetFlipPublicEncryptionKey() *ecies.PrivateKey {
-	fp.mutex.Lock()
-	defer fp.mutex.Unlock()
+	fp.mutex.RLock()
+	defer fp.mutex.RUnlock()
 
 	if fp.flipPublicKey != nil {
 		return fp.flipPublicKey
@@ -267,8 +262,8 @@ func (fp *Flipper) GetFlipPublicEncryptionKey() *ecies.PrivateKey {
 }
 
 func (fp *Flipper) GetFlipPrivateEncryptionKey() *ecies.PrivateKey {
-	fp.mutex.Lock()
-	defer fp.mutex.Unlock()
+	fp.mutex.RLock()
+	defer fp.mutex.RUnlock()
 
 	if fp.flipPrivateKey != nil {
 		return fp.flipPrivateKey
@@ -359,10 +354,10 @@ func (fp *Flipper) HasFlips() bool {
 func (fp *Flipper) IsFlipReady(key []byte) bool {
 	hash := common.Hash(rlp.Hash(key))
 
-	fp.mutex.Lock()
+	fp.mutex.RLock()
 	flip := fp.flips[hash]
 	isReady := fp.flipReadiness[hash]
-	fp.mutex.Unlock()
+	fp.mutex.RUnlock()
 
 	if flip == nil {
 		return false
@@ -383,35 +378,65 @@ func (fp *Flipper) IsFlipReady(key []byte) bool {
 	return isReady
 }
 
+func (fp *Flipper) IsFlipAvailable(key []byte) bool {
+	hash := common.Hash(rlp.Hash(key))
+
+	fp.mutex.RLock()
+	_, ok := fp.flips[hash]
+	fp.mutex.RUnlock()
+
+	return ok
+}
+
 func (fp *Flipper) UnpinFlip(flipCid []byte) {
 	fp.ipfsProxy.Unpin(flipCid)
 }
 
-func (fp *Flipper) GetRawFlip(flipCid []byte) (*IpfsFlip, error) {
-	data, err := fp.ipfsProxy.Get(flipCid)
-	if err != nil {
-		return nil, err
+func (fp *Flipper) GetRawFlip(key []byte) (publicPart []byte, privatePart []byte, err error) {
+	hash := common.Hash(rlp.Hash(key))
+
+	fp.mutex.RLock()
+	data := fp.flips[hash]
+	fp.mutex.RUnlock()
+
+	if data != nil {
+		return data.PublicPart, data.PrivatePart, nil
 	}
-	ipfsFlip := new(IpfsFlip)
-	if err := rlp.Decode(bytes.NewReader(data), ipfsFlip); err != nil {
-		oldIpfsFlip := new(IpfsFlipOld)
-		if err2 := rlp.Decode(bytes.NewReader(data), oldIpfsFlip); err2 != nil {
-			return nil, err
-		} else {
-			ipfsFlip.PublicPart = oldIpfsFlip.Data
-			ipfsFlip.PubKey = oldIpfsFlip.PubKey
-		}
-	}
-	return ipfsFlip, nil
+
+	return nil, nil, FlipIsMissingError
 }
 
-func (fp *Flipper) Has(c []byte) bool {
-	return fp.epochDb.HasFlipCid(c)
-}
+func (fp *Flipper) GetFlipKeys(key []byte) ([]byte, []byte, error) {
+	hash := common.Hash(rlp.Hash(key))
 
-func (fp *Flipper) ReadFlip(cid []byte) (*types.Flip, error) {
-	if flip, ok := fp.flipsCache.Get(string(cid)); ok {
-		return flip.(*types.Flip), nil
+	fp.mutex.RLock()
+	data := fp.flips[hash]
+	fp.mutex.RUnlock()
+
+	if data == nil {
+		return nil, nil, errors.New("keys are missing")
 	}
-	return nil, errors.New("flip is not found")
+
+	var publicEncryptionKey *ecies.PrivateKey
+	var privateEncryptionKey *ecies.PrivateKey
+	if bytes.Compare(data.PubKey, fp.secStore.GetPubKey()) == 0 {
+		publicEncryptionKey, privateEncryptionKey = fp.GetFlipPublicEncryptionKey(), fp.GetFlipPrivateEncryptionKey()
+	} else {
+		addr, _ := crypto.PubKeyBytesToAddress(data.PubKey)
+		publicEncryptionKey, privateEncryptionKey = fp.keyspool.GetPublicFlipKey(addr), fp.keyspool.GetPrivateFlipKey(addr)
+	}
+
+	if publicEncryptionKey == nil {
+		return nil, nil, errors.New("public key is missing")
+	}
+
+	var publicKeyBytes, privateKeyBytes []byte
+
+	publicKeyBytes = crypto.FromECDSA(publicEncryptionKey.ExportECDSA())
+
+	if privateEncryptionKey != nil {
+		privateKeyBytes = crypto.FromECDSA(privateEncryptionKey.ExportECDSA())
+	}
+
+	return publicKeyBytes, privateKeyBytes, nil
 }

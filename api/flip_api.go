@@ -103,9 +103,10 @@ func (api *FlipApi) Delete(ctx context.Context, hash string) (common.Hash, error
 }
 
 type FlipHashesResponse struct {
-	Hash  string `json:"hash"`
-	Ready bool   `json:"ready"`
-	Extra bool   `json:"extra"`
+	Hash      string `json:"hash"`
+	Ready     bool   `json:"ready"`
+	Extra     bool   `json:"extra"`
+	Available bool   `json:"available"`
 }
 
 func (api *FlipApi) isCeremonyCandidate() bool {
@@ -164,9 +165,10 @@ func prepareHashes(flipper *flip.Flipper, flips [][]byte, shortSession bool) ([]
 		}
 		cid, _ := cid.Parse(v)
 		result = append(result, FlipHashesResponse{
-			Hash:  cid.String(),
-			Ready: flipper.IsFlipReady(v),
-			Extra: extraFlip,
+			Hash:      cid.String(),
+			Ready:     flipper.IsFlipReady(v),
+			Available: flipper.IsFlipAvailable(v),
+			Extra:     extraFlip,
 		})
 	}
 
@@ -197,6 +199,57 @@ func (api *FlipApi) Get(hash string) (FlipResponse, error) {
 	return FlipResponse{
 		Hex:        publicPart,
 		PrivateHex: privatePart,
+	}, nil
+}
+
+type FlipResponse2 struct {
+	PublicHex  hexutil.Bytes `json:"publicHex"`
+	PrivateHex hexutil.Bytes `json:"privateHex"`
+}
+
+func (api *FlipApi) GetRaw(hash string) (FlipResponse2, error) {
+	log.Info("get raw flip request", "hash", hash)
+	defer log.Info("get raw flip response", "hash", hash)
+
+	c, err := cid.Decode(hash)
+	if err != nil {
+		return FlipResponse2{}, err
+	}
+	cidBytes := c.Bytes()
+
+	publicPart, privatePart, err := api.fp.GetRawFlip(cidBytes)
+
+	if err != nil {
+		return FlipResponse2{}, err
+	}
+
+	return FlipResponse2{
+		PublicHex:  publicPart,
+		PrivateHex: privatePart,
+	}, nil
+}
+
+type FlipKeysResponse struct {
+	PublicKey  hexutil.Bytes `json:"publicKey"`
+	PrivateKey hexutil.Bytes `json:"privateKey"`
+}
+
+func (api *FlipApi) GetKeys(hash string) (FlipKeysResponse, error) {
+	c, err := cid.Decode(hash)
+	if err != nil {
+		return FlipKeysResponse{}, err
+	}
+	cidBytes := c.Bytes()
+
+	publicKey, privateKey, err := api.fp.GetFlipKeys(cidBytes)
+
+	if err != nil {
+		return FlipKeysResponse{}, err
+	}
+
+	return FlipKeysResponse{
+		PublicKey:  publicKey,
+		PrivateKey: privateKey,
 	}, nil
 }
 
